@@ -8,12 +8,23 @@ import json
 import os
 import sys
 import time
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from ortools.sat.python import cp_model
 from pydantic import ValidationError
 
-from app.planner import PlannerError, plan, prepare
+from app import planner
+from app.planner import (
+    FEASIBLE,
+    INFEASIBLE,
+    UNKNOWN as UNK,
+    UNDETERMINED,
+    PlannerError,
+    plan,
+    prepare,
+)
 from app.schemas import PlanRequest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -345,6 +356,172 @@ def test_address_tiebreak_uses_smallest_tensor_id_of_root():
     assert r.optimal
     addr = {t.tensor_id: t.address for t in r.addresses}
     assert addr["z"] == 0 and addr["a"] == 0 and addr["b"] == 64
+
+
+def _scripted_solver(script, incumbent_on_unknown=False):
+    """Build a planner.run_solver replacement yielding tri-state labels.
+
+    FEASIBLE labels are backed by a real CP-SAT incumbent so response values
+    stay genuine; INFEASIBLE/UNKNOWN are reported from a real solve against a
+    trivially infeasible / time-starved model. ``incumbent_on_unknown`` makes
+    UNKNOWN labels carry a readable incumbent of the actual model.
+    """
+    labels = iter(script)
+
+    def fake(model, tag, time_limit):
+        label = next(labels)
+        if label == FEASIBLE:
+            solver = planner._new_solver(5.0)
+            status = solver.Solve(model)
+            assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE), tag
+            return FEASIBLE, solver, status
+        if label == INFEASIBLE:
+            probe = cp_model.CpModel()
+            v = probe.NewBoolVar("x")
+            probe.Add(v == 0)
+            probe.Add(v == 1)
+            solver = planner._new_solver(5.0)
+            status = solver.Solve(probe)
+            assert status == cp_model.INFEASIBLE
+            return INFEASIBLE, solver, status
+        # UNKNOWN: optionally back it with a genuine feasible incumbent
+        if incumbent_on_unknown:
+            solver = planner._new_solver(5.0)
+            status = solver.Solve(model)
+            assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+            return UNK, solver, cp_model.UNKNOWN
+        solver = planner._new_solver(1e-12)
+        status = solver.Solve(model)  # starved; may be UNKNOWN
+        return UNK, solver, cp_model.UNKNOWN
+
+    return fake
+
+
+def _run_scripted(script):
+    req = PlanRequest.model_validate(_load_example())
+    with mock.patch.object(planner, "run_solver", _scripted_solver(script)):
+        return plan(req)
+
+
+def test_first_unknown_with_proven_relaxations_still_reports_proven_reason():
+    # First solve timed out, but an infeasible probe on a RELAXED resource is
+    # a proof by monotonicity and must still be reported as a definitive
+    # infeasibility rather than "undetermined".
+    r = _run_scripted([UNK, INFEASIBLE, INFEASIBLE])
+    assert not r.feasible and r.reason == "deadline_and_memory_limit"
+
+    r = _run_scripted([UNK, INFEASIBLE, FEASIBLE])
+    assert not r.feasible and r.reason == "deadline"
+
+    r = _run_scripted([UNK, FEASIBLE, INFEASIBLE])
+    assert not r.feasible and r.reason == "memory_limit"
+
+    # one probe proves a resource; the other being undecided does not matter
+    r = _run_scripted([UNK, INFEASIBLE, UNK])
+    assert not r.feasible and r.reason == "deadline"
+    r = _run_scripted([UNK, UNK, INFEASIBLE])
+    assert not r.feasible and r.reason == "memory_limit"
+
+
+def test_first_unknown_without_proof_is_undetermined_not_infeasible():
+    # The core regression: a timed-out first solve with no proven-impossible
+    # relaxation must NOT masquerade as a proven infeasible reason.
+    for script in (
+        [UNK, UNK, UNK],
+        [UNK, FEASIBLE, FEASIBLE],
+        [UNK, UNK, FEASIBLE],
+        [UNK, FEASIBLE, UNK],
+    ):
+        r = _run_scripted(script)
+        assert r.feasible is False
+        assert r.reason == UNDETERMINED
+        assert r.capacity_upper_bound == 0 and r.timeline == [] and r.addresses == []
+
+
+def test_proven_infeasible_never_downgraded_to_undetermined():
+    # When the original model itself is proven INFEASIBLE, undecided probes
+    # cannot erase the proof: result stays a definite infeasibility. With no
+    # exact resource proven, reason is null (no fabricated resource cause).
+    for script in (
+        [INFEASIBLE, UNK, UNK],
+        [INFEASIBLE, UNK, FEASIBLE],
+        [INFEASIBLE, FEASIBLE, UNK],
+        [INFEASIBLE, FEASIBLE, FEASIBLE],
+    ):
+        r = _run_scripted(script)
+        assert r.feasible is False and r.reason is None, script
+
+    # proven first solve plus proven probes keeps the exact resource reason
+    r = _run_scripted([INFEASIBLE, INFEASIBLE, INFEASIBLE])
+    assert r.reason == "deadline_and_memory_limit"
+    r = _run_scripted([INFEASIBLE, FEASIBLE, INFEASIBLE])
+    assert r.reason == "memory_limit"
+    r = _run_scripted([INFEASIBLE, INFEASIBLE, FEASIBLE])
+    assert r.reason == "deadline"
+
+
+def test_later_lexicographic_stage_unknown_keeps_valid_incumbent():
+    def fake(model, tag, time_limit):
+        if tag.startswith("addr:"):
+            return UNK, None, cp_model.UNKNOWN
+        solver = planner._new_solver(5.0)
+        status = solver.Solve(model)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        return FEASIBLE, solver, status
+
+    req = PlanRequest.model_validate(_load_example())
+    with mock.patch.object(planner, "run_solver", fake):
+        r = plan(req)
+    assert r.feasible
+    assert r.optimal is False  # not every lexicographic stage was proved
+    assert r.capacity_upper_bound == 96
+    # the preserved timeline is a legal schedule
+    p1, p2 = r.timeline
+    assert (p1.start, p1.end, p1.peak_bytes) == (0, 5, 64)
+    assert (p2.start, p2.end, p2.peak_bytes) == (0, 7, 96)
+    # the preserved addresses are a legal aligned placement
+    by = {a.tensor_id: a.address for a in r.addresses}
+    assert by == {"w": 64, "x": 0, "y": 0, "yv": 16}
+
+
+def test_first_unknown_with_incumbent_is_salvaged_as_feasible():
+    # The first solve reports UNKNOWN yet holds a complete (unproven)
+    # incumbent: its legal timeline/addresses must be returned as a feasible,
+    # non-optimal plan rather than being reported as undetermined/infeasible.
+    req = PlanRequest.model_validate(_load_example())
+    with mock.patch.object(
+        planner, "run_solver", _scripted_solver([UNK], incumbent_on_unknown=True)
+    ):
+        r = plan(req)
+    assert r.feasible is True
+    assert r.optimal is False
+    assert r.capacity_upper_bound == 96
+    p1, p2 = r.timeline
+    assert (p1.start, p1.end) == (0, 5) and (p2.start, p2.end) == (0, 7)
+    by = {a.tensor_id: a.address for a in r.addresses}
+    assert by["yv"] == by["y"] + 16
+
+
+def test_feasible_but_unproved_stage_marks_nonoptimal_with_losing_plan():
+    def fake(model, tag, time_limit):
+        if tag == "first":
+            solver = planner._new_solver(5.0)
+            status = solver.Solve(model)
+            assert status == cp_model.OPTIMAL
+            return FEASIBLE, solver, status
+        if tag.startswith("addr:"):
+            # a fresh incumbent exists but optimality is not proved
+            solver = planner._new_solver(5.0)
+            solver.Solve(model)
+            return FEASIBLE, solver, cp_model.FEASIBLE
+        solver = planner._new_solver(5.0)
+        status = solver.Solve(model)
+        return FEASIBLE, solver, status
+
+    req = PlanRequest.model_validate(_load_example())
+    with mock.patch.object(planner, "run_solver", fake):
+        r = plan(req)
+    assert r.feasible and r.optimal is False
 
 
 if __name__ == "__main__":

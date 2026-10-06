@@ -1,9 +1,19 @@
 """Request/response schemas for the buffer planning API."""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# Proven resource reasons keep their historic names. "undetermined" means the
+# solver timed out before feasibility could be decided either way; the HTTP
+# layer returns it with status 503.
+InfeasibleReason = Literal[
+    "deadline",
+    "memory_limit",
+    "deadline_and_memory_limit",
+    "undetermined",
+]
 
 
 def _as_int(name: str, v: object) -> int:
@@ -194,7 +204,7 @@ class TensorAddress(BaseModel):
 class PlanResponse(BaseModel):
     feasible: bool
     optimal: bool
-    reason: Optional[str] = None
+    reason: Optional[InfeasibleReason] = None
     capacity_upper_bound: int
     timeline: list[PathSchedule]
     addresses: list[TensorAddress]

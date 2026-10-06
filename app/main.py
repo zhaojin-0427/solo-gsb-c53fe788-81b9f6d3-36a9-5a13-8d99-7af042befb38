@@ -1,11 +1,12 @@
 """FastAPI application exposing POST /plans."""
 from __future__ import annotations
 
-from fastapi import FastAPI
-from fastapi.exceptions import RequestValidationError
+from typing import Optional
+
+from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 
-from .planner import PlannerError, plan
+from .planner import PlannerError, UNDETERMINED, plan
 from .schemas import PlanRequest, PlanResponse
 
 app = FastAPI(
@@ -32,6 +33,39 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/plans", response_model=PlanResponse)
-async def create_plan(request: PlanRequest) -> PlanResponse:
-    return plan(request)
+@app.post(
+    "/plans",
+    response_model=PlanResponse,
+    responses={503: {"model": PlanResponse, "description": "Result undecided (solver timeout)"}},
+)
+async def create_plan(
+    request: PlanRequest,
+    x_solver_timeout_seconds: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """Plan a schedule and buffer layout.
+
+    Status codes:
+
+    * **200** — a definite result: either a feasible plan or a *proven*
+      infeasibility carrying its resource ``reason``;
+    * **503** — feasibility could not be decided within the time budget
+      (``reason="undetermined"``). The request may be retried; this is never a
+      proof that no plan exists;
+    * **422** — the request body is structurally or semantically invalid.
+    """
+    override: Optional[float] = None
+    if x_solver_timeout_seconds is not None:
+        try:
+            override = float(x_solver_timeout_seconds)
+        except (TypeError, ValueError):
+            raise PlannerError(
+                "X-Solver-Timeout-Seconds must be a positive number of seconds"
+            )
+        if not (override > 0.0) or override != override or override == float("inf"):
+            raise PlannerError(
+                "X-Solver-Timeout-Seconds must be a finite positive number of seconds"
+            )
+
+    result = plan(request, override_seconds=override)
+    status_code = 503 if result.reason == UNDETERMINED else 200
+    return JSONResponse(status_code=status_code, content=result.model_dump())

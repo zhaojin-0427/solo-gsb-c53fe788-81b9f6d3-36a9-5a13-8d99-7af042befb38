@@ -24,6 +24,23 @@
 `optimal=true` 仅当 CP-SAT 对以上每一阶段都证明了最优；只要任何一个阶段
 在时限内未能证明，返回的仍是合法可行解，但 `optimal=false`。
 
+求解结果是**三态**证据，服务严格依据证据裁决，绝不把「未判定」说成「无解」：
+
+| 证据 | 结论 | HTTP |
+| --- | --- | --- |
+| 找到可行解（含首次求解虽 `UNKNOWN` 但已持有完整可行 incumbent） | `feasible=true`（含合法时间轴与地址）；未获全部最优证明时 `optimal=false` | 200 |
+| 首次求解**证明** `INFEASIBLE`，或放宽探针证明某资源不可能满足 | `feasible=false` + 已证 `reason` | 200 |
+| 首次求解 `UNKNOWN`、无可用 incumbent，且没有任何探针给出不可能性证明 | `feasible=false, reason="undetermined"` | **503** |
+
+两个诊断探针分别**放宽显存**（显存提到必然放得下的上界、仍受原 deadline
+约束；该探针若被证无解，说明给多少显存都赶不上 deadline，原因才是
+`deadline`）与**放宽截止时间**（截止时间提到必然排得下的上界、仍受原
+memory_limit 约束；该探针若被证无解，说明排多久都放不下，原因才是
+`memory_limit`）。在「放宽后的」问题上被证明不可能，才允许把该资源记为
+无解原因；探针自身若返回 `UNKNOWN`，则该探针不提供任何证明，绝不能据此
+臆测精确的资源原因。若首次求解本身已证无解、但探针无法锁定具体资源，仍
+返回 200 且 `reason=null`（确属无解，但不臆造原因）。
+
 ---
 
 ## 1. 一键启动（Docker Compose）
@@ -77,11 +94,17 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
     累计偏移必须按自身对齐对齐，且视图区间不得超出基张量；视图链不得成环；
   - 同名张量在不同路径中的定义（字节数、对齐、基张量、偏移）必须完全一致。
 - 返回：
-  - 可行：`feasible=true`，含时间轴 `timeline`（每条路径起止、各算子起止、
-    该路径 `peak_bytes`）与所有张量地址 `addresses`；
-  - 无解：`feasible=false`，`reason` 为 `deadline` / `memory_limit` /
-    `deadline_and_memory_limit`；
+  - 可行：HTTP **200**，`feasible=true`，含时间轴 `timeline`（每条路径
+    起止、各算子起止、该路径 `peak_bytes`）与所有张量地址 `addresses`；
+  - 已证无解：HTTP **200**，`feasible=false`，`reason` 为 `deadline` /
+    `memory_limit` / `deadline_and_memory_limit`（仅在对应资源被探针
+    **证明**不可能时给出；确属无解但无法锁定单一资源时 `reason=null`）；
+  - 求解超时未判定：HTTP **503**，`reason="undetermined"`。这表示 CP-SAT
+    在时限内既没找到可行解、也没有证明无解，**不是**「无解」，可稍后重试；
   - 任何结构或语义错误返回 **HTTP 422**。
+- 可选请求头 `X-Solver-Timeout-Seconds: <正数秒>`：覆盖每次 CP-SAT 求解
+  的时间预算（首次求解、各字典序阶段、两个诊断探针统一使用该值），用于
+  稳定复现 / 核查超时行为。非法值（非数字、非正、NaN、无穷）返回 422。
 
 ### curl 示例（与实现实际输出一致）
 
@@ -162,6 +185,35 @@ curl -s -X POST http://localhost:8000/plans -H 'Content-Type: application/json' 
 # {"feasible":false,"optimal":false,"reason":"memory_limit", ...}
 ```
 
+### 求解超时未判定示例（HTTP 503，可复核）
+
+用大规模输入 [`examples/stress_payload.json`](examples/stress_payload.json)
+配合极小的求解时间预算，即可稳定让 CP-SAT 首次求解与两个探针都超时
+（`UNKNOWN`）。该实例在默认预算下其实可行（1~2 秒内返回
+`feasible=true`），因此这里的 503 确实是「超时未判定」而非无解——修复前
+这种情况会被误报成 `feasible=false` 且臆造一个 `reason`：
+
+```bash
+curl -s -i -X POST http://localhost:8000/plans \
+  -H 'Content-Type: application/json' \
+  -H 'X-Solver-Timeout-Seconds: 0.00001' \
+  -d @examples/stress_payload.json
+# HTTP/1.1 503 Service Unavailable
+# ...
+# {"feasible":false,"optimal":false,"reason":"undetermined",
+#  "capacity_upper_bound":0,"timeline":[],"addresses":[]}
+```
+
+同一个请求去掉该请求头（或给足时间）即返回 200 与可行规划，可对照复核。
+超时请求头取值非法时返回 422：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/plans \
+  -H 'Content-Type: application/json' -H 'X-Solver-Timeout-Seconds: abc' \
+  -d @examples/request.json
+# 422
+```
+
 ### 无效输入（HTTP 422）
 
 - 非正整数耗时 / 字节数 / 截止时间 / 显存、对齐不是 2 的幂、未知引用、
@@ -192,7 +244,13 @@ curl -i -X POST http://localhost:8000/plans -H 'Content-Type: application/json' 
 - 地址使用模约束按 2 的幂对齐；视图链取链上最严格的对齐放置基张量。
 - 求解采用单模型增量字典序：先最小化容量并固定，再逐个最小化张量地址、
   路径起点、算子起点，每个变量优化后立即固定；每个阶段带解提示（hint）
-  热启动。可行性诊断分别放松截止时间与显存各求解一次，以区分无解原因。
+  热启动。任一后续阶段只拿到可行解而未获最优证明、或阶段超时，都会保留
+  当前合法解并把 `optimal` 置为 `false`。
+- 首次求解与两个诊断探针都按**可行 / 已证无解 / 未判定（UNKNOWN）**三态
+  处理：仅在放宽后的问题上被证明不可能才报告对应 `deadline` /
+  `memory_limit` / 二者原因；首次求解未判定且探针拿不到不可能性证明时，
+  返回 `reason="undetermined"`（HTTP 503），绝不冒充已证无解，也不凭
+  UNKNOWN 探针臆测精确资源原因。
 
 ---
 
@@ -200,14 +258,17 @@ curl -i -X POST http://localhost:8000/plans -H 'Content-Type: application/json' 
 
 ```bash
 pip install httpx
-python3 tests/test_planner.py   # 15 项规划语义/最优性测试
-python3 tests/test_api.py       # 7 项 HTTP 契约测试（含示例响应逐字段比对）
+python3 tests/test_planner.py   # 21 项规划语义/最优性/三态裁决测试
+python3 tests/test_api.py       # 11 项 HTTP 契约测试（含 503 超时与示例比对）
 ```
 
 测试覆盖：互斥路径时间轴重叠与地址复用、同路径同时存活张量仍互斥、并行
 fork-join 共存、半开区间边界复用、视图延长基张量占用、跨路径复用、
-截止 / 显存无解分类、同名张量一致性、依赖环、视图越界、422 契约，以及
-大规模实例的性能与“不轻易声称最优”。
+截止 / 显存无解分类、**首次求解或探针 UNKNOWN 时的三态裁决（不冒充无解、
+不臆造资源原因、已证探针仍可锁定资源、后续阶段超时保留合法 incumbent）**、
+**真实 CP-SAT 超时经 `X-Solver-Timeout-Seconds` 返回 503**、同名张量
+一致性、依赖环、视图越界、422 契约，以及大规模实例的性能与“不轻易声称
+最优”。
 
 ## 目录结构
 
