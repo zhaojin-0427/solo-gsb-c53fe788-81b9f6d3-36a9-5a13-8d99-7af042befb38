@@ -8,15 +8,31 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pydantic import ValidationError
 
+from app import planner
 from app.planner import PlannerError, plan, prepare
 from app.schemas import PlanRequest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@contextmanager
+def _time_budgets(**overrides):
+    # Force CP-SAT time limits per stage; a 0s limit makes every solve return
+    # UNKNOWN, which deterministically reproduces real time-out evidence.
+    defaults = {"stage1": 10.0, "stage": 0.3, "op_stage": 0.08, "probe": 5.0}
+    defaults.update(overrides)
+    saved = planner._time_limits
+    planner._time_limits = lambda: dict(defaults)
+    try:
+        yield
+    finally:
+        planner._time_limits = saved
 
 
 def _load_example() -> dict:
@@ -345,6 +361,167 @@ def test_address_tiebreak_uses_smallest_tensor_id_of_root():
     assert r.optimal
     addr = {t.tensor_id: t.address for t in r.addresses}
     assert addr["z"] == 0 and addr["a"] == 0 and addr["b"] == 64
+
+
+# --------------------------------------------------------------------------- #
+# Three-valued evidence: FEASIBLE / INFEASIBLE / UNKNOWN are never conflated.
+# --------------------------------------------------------------------------- #
+def _assert_legal_feasible_plan(payload: dict, r) -> None:
+    assert r.status == "feasible"
+    assert r.feasible is True and r.reason is None
+    assert r.timeline and r.addresses
+    prep = prepare(PlanRequest.model_validate(payload))
+    amap = {a.tensor_id: a.address for a in r.addresses}
+    # views stay inside their root, every address obeys its own alignment
+    for tid, info in prep.tensors.items():
+        assert amap[tid] == amap[info.root] + info.cum_offset
+        assert amap[tid] % info.alignment == 0
+        assert 0 <= amap[tid]
+    assert 0 < r.capacity_upper_bound <= payload["memory_limit"]
+    # each path window obeys the deadline and operator windows are consistent
+    for i, ps in enumerate(r.timeline):
+        assert ps.start <= ps.end <= payload["deadline"]
+        dur = {oid: d for oid, (d, _) in prep.path_ops[ps.path_id].items()}
+        for op in ps.operators:
+            assert op.end - op.start == dur[op.operator_id]
+        assert ps.start == min(o.start for o in ps.operators)
+        assert ps.end == max(o.end for o in ps.operators)
+        assert ps.peak_bytes <= r.capacity_upper_bound
+
+
+def test_feasible_response_shape():
+    r = _plan(_load_example())
+    assert r.status == "feasible" and r.feasible is True and r.reason is None
+
+
+def test_infeasible_response_shape_and_reasons():
+    p = _load_example()
+    for mods, reason in (
+        ({"deadline": 6}, "deadline"),
+        ({"memory_limit": 95}, "memory_limit"),
+        ({"deadline": 6, "memory_limit": 64}, "deadline_and_memory_limit"),
+    ):
+        q = json.loads(json.dumps(p)); q.update(mods)
+        r = _plan(q)
+        assert r.status == "infeasible"
+        assert r.feasible is False and r.reason == reason
+        assert not r.timeline and not r.addresses
+        assert r.capacity_upper_bound == 0 and not r.optimal
+
+
+def test_timeout_on_first_solve_is_reported_unknown_not_infeasible():
+    # Every solve (first + both probes) times out -> nothing is proved. The
+    # answer must say undecided, not fabricate infeasibility or a reason.
+    p = _load_example()
+    with _time_budgets(stage1=0.0, probe=0.0):
+        r = _plan(p)
+    assert r.status == "unknown"
+    assert r.feasible is None and r.reason is None
+    assert not r.optimal and r.capacity_upper_bound == 0
+    assert r.timeline == [] and r.addresses == []
+
+
+def test_unknown_first_solve_still_unknown_on_truly_infeasible_input():
+    # The request is genuinely deadline-infeasible, but if no solve proves
+    # anything in time, that impossibility must not be asserted.
+    p = _load_example(); p["deadline"] = 6
+    with _time_budgets(stage1=0.0, probe=0.0):
+        r = _plan(p)
+    assert r.status == "unknown"
+    assert r.feasible is None and r.reason is None
+
+
+def test_first_unknown_is_rescued_by_feasible_probe_with_real_plan():
+    # First solve times out, but the relaxed probes find a witness that also
+    # satisfies both original bounds. The answer is a concrete legal plan;
+    # optimality cannot be claimed after an unresolved first stage.
+    p = _load_example()
+    with _time_budgets(stage1=0.0):
+        r = _plan(p)
+    _assert_legal_feasible_plan(p, r)
+    assert r.optimal is False
+
+
+def test_proved_infeasible_first_solve_with_timed_out_probes_has_no_reason():
+    # The first solve proves infeasibility, but both diagnostic probes time
+    # out. Infeasibility is established; the exact resource cause is not, so
+    # reason must stay null rather than guess deadline/memory_limit.
+    p = _load_example(); p["deadline"] = 6
+    with _time_budgets(probe=0.0):
+        r = _plan(p)
+    assert r.status == "infeasible"
+    assert r.feasible is False and r.reason is None
+
+
+def test_one_probe_unknown_never_invents_resource_reason():
+    # First solve proves infeasible; force exactly one of the two probes to
+    # report UNKNOWN. No precise reason may be claimed regardless of what the
+    # other probe proved.
+    p = _load_example(); p["deadline"] = 6
+    call = {"n": 0}
+    real_solve = planner.cp_model.CpSolver.Solve
+
+    def scripted_solve(self, model):
+        call["n"] += 1
+        # call 1 = first solve (proves INFEASIBLE quickly with full budget);
+        # calls 2,3 = deadline/memory probes: probe 2 forced UNKNOWN.
+        if call["n"] == 2:
+            return planner.cp_model.UNKNOWN
+        return real_solve(self, model)
+
+    planner.cp_model.CpSolver.Solve = scripted_solve
+    try:
+        r = _plan(p)
+    finally:
+        planner.cp_model.CpSolver.Solve = real_solve
+    assert r.status == "infeasible"
+    assert r.feasible is False and r.reason is None
+
+
+def test_deadline_probe_proves_obstruction_when_other_probe_unknown():
+    # First solve UNKNOWN; deadline probe proves INFEASIBLE even with abundant
+    # memory (obstruction survives extra memory) while the memory probe times
+    # out: the request is proved infeasible, but the exact reason is not set.
+    p = _load_example(); p["deadline"] = 6
+    call = {"n": 0}
+    real_solve = planner.cp_model.CpSolver.Solve
+
+    def scripted_solve(self, model):
+        call["n"] += 1
+        if call["n"] == 1 or call["n"] == 3:
+            return planner.cp_model.UNKNOWN
+        return real_solve(self, model)  # call 2: deadline probe, proves it
+
+    planner.cp_model.CpSolver.Solve = scripted_solve
+    try:
+        r = _plan(p)
+    finally:
+        planner.cp_model.CpSolver.Solve = real_solve
+    assert r.status == "infeasible"
+    assert r.feasible is False and r.reason is None
+
+
+def test_feasible_incumbent_survives_later_stage_timeout_and_is_never_optimal():
+    # Stage 1 finds the optimum, but force a later lexicographic stage to time
+    # out: the pinned-prefix incumbent must still be returned as a legal plan,
+    # and optimality must not be claimed.
+    p = _load_example()
+    call = {"n": 0}
+    real_solve = planner.cp_model.CpSolver.Solve
+
+    def scripted_solve(self, model):
+        call["n"] += 1
+        if call["n"] == 2:  # first address stage
+            return planner.cp_model.UNKNOWN
+        return real_solve(self, model)
+
+    planner.cp_model.CpSolver.Solve = scripted_solve
+    try:
+        r = _plan(p)
+    finally:
+        planner.cp_model.CpSolver.Solve = real_solve
+    _assert_legal_feasible_plan(p, r)
+    assert r.optimal is False
 
 
 if __name__ == "__main__":

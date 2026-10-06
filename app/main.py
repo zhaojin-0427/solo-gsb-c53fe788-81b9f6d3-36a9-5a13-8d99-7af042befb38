@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
-from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .planner import PlannerError, plan
@@ -32,6 +31,23 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/plans", response_model=PlanResponse)
-async def create_plan(request: PlanRequest) -> PlanResponse:
-    return plan(request)
+@app.post(
+    "/plans",
+    response_model=PlanResponse,
+    responses={
+        200: {"description": "A feasible plan, or a proved-infeasible request "
+                             "(see body fields ``status``/``reason``)."},
+        422: {"description": "Invalid request structure or semantics."},
+        503: {"description": "Undecided: the solver neither found a plan nor "
+                             "proved infeasibility within its time budget. "
+                             "The request may be retried; this is not a "
+                             "proof of impossibility."},
+    },
+)
+async def create_plan(request: PlanRequest):
+    result = plan(request)
+    if result.status == "unknown":
+        # Explicitly undecided: distinguishable at the HTTP level from both a
+        # successful plan and a proved-infeasible answer, and safe to retry.
+        return JSONResponse(status_code=503, content=result.model_dump())
+    return result

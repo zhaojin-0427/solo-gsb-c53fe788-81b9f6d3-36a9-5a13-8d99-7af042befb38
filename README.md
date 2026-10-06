@@ -24,6 +24,16 @@
 `optimal=true` 仅当 CP-SAT 对以上每一阶段都证明了最优；只要任何一个阶段
 在时限内未能证明，返回的仍是合法可行解，但 `optimal=false`。
 
+求解证据始终按**三值**对待：
+
+- **可行**（CP-SAT 返回 OPTIMAL/FEASIBLE）：返回合法的时间轴与地址；
+- **已证无解**（INFEASIBLE）：返回无解结论，且仅当两次资源诊断探针都有
+  明确结论时才标注具体 `reason`；
+- **未判定**（UNKNOWN，通常是超时）：既不冒充可行也不冒充无解，也不臆测
+  是 deadline 还是 memory_limit 造成的。
+
+三种裁决在 HTTP 层同样可区分（见第 2 节）。
+
 ---
 
 ## 1. 一键启动（Docker Compose）
@@ -48,6 +58,16 @@ curl http://localhost:8000/health
 ```bash
 docker compose down
 ```
+
+如需复现求解超时（未判定，HTTP 503），可在宿主机用环境变量把各阶段 CP-SAT
+时限压到 0 后再启动（compose 文件会透传这些变量）：
+
+```bash
+PLANNER_STAGE1_SECONDS=0 PLANNER_PROBE_SECONDS=0 docker compose up --build
+```
+
+默认值（10s / 0.3s / 0.08s / 5s）写在 `docker-compose.yml` 中，与代码内置
+默认完全一致；不设置这些变量时行为不变。
 
 ### 不使用 Docker（本地开发）
 
@@ -76,12 +96,23 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   - `base_tensor` / `view_offset`：可选，表示该张量是基张量上的视图；
     累计偏移必须按自身对齐对齐，且视图区间不得超出基张量；视图链不得成环；
   - 同名张量在不同路径中的定义（字节数、对齐、基张量、偏移）必须完全一致。
-- 返回：
-  - 可行：`feasible=true`，含时间轴 `timeline`（每条路径起止、各算子起止、
-    该路径 `peak_bytes`）与所有张量地址 `addresses`；
-  - 无解：`feasible=false`，`reason` 为 `deadline` / `memory_limit` /
-    `deadline_and_memory_limit`；
-  - 任何结构或语义错误返回 **HTTP 422**。
+- 返回（三种裁决，HTTP 层可区分）：
+  - **可行 — HTTP 200**：`status="feasible"`、`feasible=true`，含时间轴
+    `timeline`（每条路径起止、各算子起止、该路径 `peak_bytes`）与所有张量
+    地址 `addresses`；
+  - **已证无解 — HTTP 200**：`status="infeasible"`、`feasible=false`。
+    仅当放宽显存、放宽截止时间两次诊断探针都拿到明确结论时，`reason` 才为
+    `deadline` / `memory_limit` / `deadline_and_memory_limit`；若某支探针
+    超时未判定，无解本身成立但**精确资源原因不可证**，此时 `reason=null`；
+  - **未判定 — HTTP 503**：首次求解与两支探针都没能在时限内给出可行解或
+    无解证明（CP-SAT 的 UNKNOWN）。`status="unknown"`、`feasible=null`、
+    `reason=null`。这**不是**无解结论，请求可稍后重试；首次 UNKNOWN 绝不
+    会被当作已证无解。
+  - 特殊情况：首次求解 UNKNOWN，但某支放宽探针找到了**同时满足原始
+    deadline 与 memory_limit** 的可行见证，则升级为 HTTP 200 可行响应
+    （`optimal` 必为 `false`），返回该见证对应的合法时间轴与地址。
+- 无论可行与否，`optimal=true` 都要求全部字典序阶段都获最优证明。
+- 任何结构或语义错误返回 **HTTP 422**。
 
 ### curl 示例（与实现实际输出一致）
 
@@ -98,6 +129,7 @@ curl -s -X POST http://localhost:8000/plans \
 
 ```json
 {
+  "status": "feasible",
   "feasible": true,
   "optimal": true,
   "reason": null,
@@ -147,20 +179,46 @@ curl -s -X POST http://localhost:8000/plans \
 - `y` 与 `P1` 时期的 `x` 分属互斥路径，即使时间轴完全重叠也都能使用
   地址 0（跨路径复用）；同名张量 `w` 在两条路径中共享同一全局地址 64。
 
-### 无解示例
+### 已证无解示例（HTTP 200，`status="infeasible"`）
 
 ```bash
 # P2 单独也需要 7，截止 6 无解
 curl -s -X POST http://localhost:8000/plans -H 'Content-Type: application/json' \
   -d "$(python3 -c 'import json;d=json.load(open("examples/request.json"));d["deadline"]=6;print(json.dumps(d))')"
-# {"feasible":false,"optimal":false,"reason":"deadline",
+# {"status":"infeasible","feasible":false,"optimal":false,"reason":"deadline",
 #  "capacity_upper_bound":0,"timeline":[],"addresses":[]}
 
 # 最小容量为 96，显存给 95 无解
 curl -s -X POST http://localhost:8000/plans -H 'Content-Type: application/json' \
   -d "$(python3 -c 'import json;d=json.load(open("examples/request.json"));d["memory_limit"]=95;print(json.dumps(d))')"
-# {"feasible":false,"optimal":false,"reason":"memory_limit", ...}
+# {"status":"infeasible","feasible":false,"optimal":false,"reason":"memory_limit",
+#  "capacity_upper_bound":0,"timeline":[],"addresses":[]}
 ```
+
+### 超时未判定示例（HTTP 503，`status="unknown"`）
+
+先以零求解时限启动服务（见第 1 节）：
+
+```bash
+PLANNER_STAGE1_SECONDS=0 PLANNER_PROBE_SECONDS=0 docker compose up --build
+```
+
+再发送同一个请求：
+
+```bash
+curl -i -s -X POST http://localhost:8000/plans \
+  -H 'Content-Type: application/json' -d @examples/request.json
+# HTTP/1.1 503 Service Unavailable
+# ...
+# {"status":"unknown","feasible":null,"optimal":false,"reason":null,
+#  "capacity_upper_bound":0,"timeline":[],"addresses":[]}
+```
+
+含义是：时限内**既没找到可行解、也没证明无解**。它不携带 `reason`，不能
+当作无解结论；恢复默认时限（`docker compose up --build`）重新请求即可得到
+上面的 200 可行响应。若 CP-SAT 很快证明无解、但某次诊断探针超时，响应仍是
+200 + `status="infeasible"`，只是 `reason` 为 `null`（无解可证、具体资源
+原因不可证）。
 
 ### 无效输入（HTTP 422）
 
@@ -192,7 +250,12 @@ curl -i -X POST http://localhost:8000/plans -H 'Content-Type: application/json' 
 - 地址使用模约束按 2 的幂对齐；视图链取链上最严格的对齐放置基张量。
 - 求解采用单模型增量字典序：先最小化容量并固定，再逐个最小化张量地址、
   路径起点、算子起点，每个变量优化后立即固定；每个阶段带解提示（hint）
-  热启动。可行性诊断分别放松截止时间与显存各求解一次，以区分无解原因。
+  热启动，已找到的可行现任解会快照保留——后续阶段即使超时也仍返回该合法
+  解，只是 `optimal=false`。
+- 可行性诊断分别放松截止时间与显存各求解一次。**三次求解（首次 + 两支
+  探针）的 OPTIMAL/FEASIBLE、INFEASIBLE、UNKNOWN 证据分别记录**：探针
+  UNKNOWN 时绝不按“不可行”处理；只有两支探针都确定时才给精确 `reason`，
+  首次 UNKNOWN 且无可行见证时整体裁决为未判定（HTTP 503）。
 
 ---
 
@@ -200,14 +263,17 @@ curl -i -X POST http://localhost:8000/plans -H 'Content-Type: application/json' 
 
 ```bash
 pip install httpx
-python3 tests/test_planner.py   # 15 项规划语义/最优性测试
-python3 tests/test_api.py       # 7 项 HTTP 契约测试（含示例响应逐字段比对）
+python3 tests/test_planner.py   # 24 项规划语义/最优性/三值证据裁决测试
+python3 tests/test_api.py       # 10 项 HTTP 契约测试（含示例响应逐字段比对）
 ```
 
 测试覆盖：互斥路径时间轴重叠与地址复用、同路径同时存活张量仍互斥、并行
 fork-join 共存、半开区间边界复用、视图延长基张量占用、跨路径复用、
 截止 / 显存无解分类、同名张量一致性、依赖环、视图越界、422 契约，以及
-大规模实例的性能与“不轻易声称最优”。
+大规模实例的性能与“不轻易声称最优”。三值证据部分覆盖：首次求解超时
+（UNKNOWN）上报 HTTP 503 `unknown` 而非误报无解、UNKNOWN 被探针可行见证
+救回为合法非最优计划、首次 INFEASIBLE 但探针超时时 `reason=null`、单支
+探针 UNKNOWN 不臆测资源原因、后续字典序阶段超时时保留合法现任解。
 
 ## 目录结构
 

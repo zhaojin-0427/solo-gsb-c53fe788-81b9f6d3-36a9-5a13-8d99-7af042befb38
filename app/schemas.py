@@ -1,7 +1,7 @@
 """Request/response schemas for the buffer planning API."""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -192,9 +192,21 @@ class TensorAddress(BaseModel):
 
 
 class PlanResponse(BaseModel):
-    feasible: bool
+    # Adjudication of the request, based solely on the evidence CP-SAT produced:
+    #
+    # * ``feasible``  – a feasible plan was found (``timeline``/``addresses``);
+    # * ``infeasible`` – impossibility was proved (``reason`` identifies which
+    #   resource bound is responsible);
+    # * ``unknown``    – neither was settled within the time budget. The solver
+    #   timed out on the first solve and no probe yielded a feasible witness;
+    #   ``feasible`` is ``null`` and ``reason`` is ``null`` — the request is
+    #   neither answered nor falsely reported as infeasible.
+    status: Literal["feasible", "infeasible", "unknown"]
+    feasible: Optional[bool]
     optimal: bool
-    reason: Optional[str] = None
+    # Set only when status == "infeasible" and both diagnostic probes delivered
+    # a definite answer; left null whenever the exact cause is not proved.
+    reason: Optional[Literal["deadline", "memory_limit", "deadline_and_memory_limit"]] = None
     capacity_upper_bound: int
     timeline: list[PathSchedule]
     addresses: list[TensorAddress]

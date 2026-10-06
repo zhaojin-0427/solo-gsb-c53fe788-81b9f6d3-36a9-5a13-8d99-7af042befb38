@@ -21,9 +21,20 @@ Optimization is strictly lexicographic:
 
 Only when CP-SAT proves every lexicographic stage optimal is the result marked
 ``optimal``.
+
+Evidence from the solver is always handled three-valued:
+
+* OPTIMAL / FEASIBLE prove feasibility and carry a solution;
+* INFEASIBLE proves impossibility;
+* UNKNOWN (typically a time-out) settles *nothing*.
+
+The first solve and the two resource probes therefore never collapse those
+cases, and the API distinguishes a feasible plan, a proved-infeasible request
+(with a proved resource ``reason``) and an undecided one.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -404,10 +415,32 @@ def build_model(prep: Prepared, deadline: int, memory_limit: int) -> ModelArtifa
 # --------------------------------------------------------------------------- #
 # Solving (lexicographic)
 # --------------------------------------------------------------------------- #
-_TIME_STAGE1 = 10.0
-_TIME_STAGE = 0.3
-_TIME_OP_STAGE = 0.08
-_TIME_PROBE = 5.0
+# OPTIMAL/FEASIBLE prove feasibility and carry a solution; INFEASIBLE proves
+# impossibility; anything else (a time-out gives UNKNOWN) settles nothing.
+# Every adjudication keeps those three cases apart and never promotes an
+# undecided answer into a proved-infeasible one.
+_PROVED_FEASIBLE = (cp_model.OPTIMAL, cp_model.FEASIBLE)
+
+
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return default
+
+
+def _time_limits() -> dict[str, float]:
+    # Per-stage CP-SAT budgets; overridable via the environment so that
+    # time-out (UNKNOWN) behaviour can be reproduced deterministically.
+    return {
+        "stage1": _env_seconds("PLANNER_STAGE1_SECONDS", 10.0),
+        "stage": _env_seconds("PLANNER_STAGE_SECONDS", 0.3),
+        "op_stage": _env_seconds("PLANNER_OP_STAGE_SECONDS", 0.08),
+        "probe": _env_seconds("PLANNER_PROBE_SECONDS", 5.0),
+    }
 
 
 def _new_solver(time_limit: float) -> cp_model.CpSolver:
@@ -418,21 +451,68 @@ def _new_solver(time_limit: float) -> cp_model.CpSolver:
     return solver
 
 
+@dataclass
+class Snapshot:
+    """Values of every decision variable in one feasible assignment.
+
+    A snapshot outlives the solve that produced it, so a later time-out can
+    never destroy or fake an earlier feasible answer.
+    """
+    s: dict          # (pid, oid) -> int
+    f: dict
+    sp: dict         # pid -> int
+    ep: dict
+    addr: dict       # root id -> int
+    cap: int
+    lstart: dict     # (pid, root) -> int
+    lend: dict
+    presence: dict
+
+
+@dataclass
+class ProbeResult:
+    """Outcome of one single-resource relaxation solve."""
+    feasible: Optional[bool]       # True / False / None (= undecided)
+    snapshot: Optional[Snapshot] = None
+
+
+def _snapshot(prep: Prepared, art: ModelArtifacts, solver: cp_model.CpSolver) -> Snapshot:
+    return Snapshot(
+        s={k: solver.Value(v) for k, v in art.s.items()},
+        f={k: solver.Value(v) for k, v in art.f.items()},
+        sp={k: solver.Value(v) for k, v in art.sp.items()},
+        ep={k: solver.Value(v) for k, v in art.ep.items()},
+        addr={k: solver.Value(v) for k, v in art.addr.items()},
+        cap=solver.Value(art.cap),
+        lstart={k: solver.Value(v) for k, v in art.lstart.items()},
+        lend={k: solver.Value(v) for k, v in art.lend.items()},
+        presence={k: solver.Value(v) for k, v in art.presence.items()},
+    )
+
+
 def plan(req: PlanRequest) -> PlanResponse:
     prep = prepare(req)
     art = build_model(prep, req.deadline, req.memory_limit)
     m = art.model
+    limits = _time_limits()
 
-    solver = _new_solver(_TIME_STAGE1)
+    # Stage 1: minimize the required capacity.
+    solver = _new_solver(limits["stage1"])
     m.Minimize(art.cap)
-    st = solver.Solve(m)
-    if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return _infeasible_response(prep, req)
+    first = solver.Solve(m)
+    if first not in _PROVED_FEASIBLE:
+        # INFEASIBLE may still receive a proved resource reason; UNKNOWN may
+        # still be rescued by a feasible relaxation witness. Either way the
+        # three-valued evidence decides — it is never just called "no solution".
+        return _adjudicate_negative(prep, req, first)
 
-    all_optimal = st == cp_model.OPTIMAL
-
-    def fix(var) -> None:
-        m.Add(var == solver.Value(var))
+    # A feasible incumbent exists from here on. Snapshot it so later
+    # lexicographic stages cannot retroactively turn it into an "infeasible"
+    # or "unknown" answer: pinned prefixes together with the snapshot's
+    # remaining values always stay feasible.
+    snap = _snapshot(prep, art, solver)
+    all_optimal = first == cp_model.OPTIMAL
+    m.Add(art.cap == snap.cap)
 
     def hint_current() -> None:
         # Warm-start the next solve with the incumbent solution so that the
@@ -448,7 +528,6 @@ def plan(req: PlanRequest) -> PlanResponse:
 
         for var in art.addr.values():
             hint(var)
-        hint(art.cap)
         for pid in prep.path_ids:
             hint(art.sp[pid])
             hint(art.ep[pid])
@@ -460,26 +539,28 @@ def plan(req: PlanRequest) -> PlanResponse:
                 hint(art.lstart[(pid, r)])
                 hint(art.lend[(pid, r)])
 
-    def stage(var, time_limit: float) -> None:
-        nonlocal all_optimal
+    def stage(var, time_limit: float) -> str:
+        """Optimize one coordinate; return 'optimal'/'feasible'/'unknown'."""
+        nonlocal snap, all_optimal
         hint_current()
         solver.parameters.max_time_in_seconds = time_limit
         m.Minimize(var)
         status = solver.Solve(m)
-        if status == cp_model.OPTIMAL:
-            fix(var)
-            return True
-        if status == cp_model.FEASIBLE:
-            fix(var)
-        # not proved optimal: lexicographic optimality cannot be recovered,
-        # but the incumbent is still a valid feasible solution
+        if status in _PROVED_FEASIBLE:
+            snap = _snapshot(prep, art, solver)
+            m.Add(var == solver.Value(var))
+            if status != cp_model.OPTIMAL:
+                # a valid feasible incumbent, but optimality of this
+                # coordinate (and hence the lexicographic whole) is unproved
+                all_optimal = False
+                return "feasible"
+            return "optimal"
+        # INFEASIBLE cannot occur with a pinned feasible prefix; UNKNOWN just
+        # leaves the previous feasible snapshot in force as a legal plan.
         all_optimal = False
-        return False
+        return _status_name(status)
 
-    # 1. capacity proved/held -> fix it
-    fix(art.cap)
-
-    def run_all() -> bool:
+    def run_all() -> None:
         # 2. tensor addresses in tensor-id order. One variable decides the
         # address of a whole root (views move with it), so roots are ordered
         # by the smallest tensor id among the root and its views.
@@ -489,46 +570,142 @@ def plan(req: PlanRequest) -> PlanResponse:
             if r in prep.live_roots:
                 root_priority[r] = min(root_priority.get(r, tid), tid)
         for r in sorted(root_priority, key=lambda x: root_priority[x]):
-            if not stage(art.addr[r], _TIME_STAGE):
-                return False
+            result = stage(art.addr[r], limits["stage"])
+            if result not in ("optimal", "feasible"):
+                return
 
         # 3. path starts in path-id order
         for pid in prep.path_ids:
-            if not stage(art.sp[pid], _TIME_STAGE):
-                return False
+            result = stage(art.sp[pid], limits["stage"])
+            if result not in ("optimal", "feasible"):
+                return
 
         # 4. operator starts by (operator id, path id)
         op_keys = sorted(art.s.keys(), key=lambda k: (k[1], k[0]))
         for key in op_keys:
-            if not stage(art.s[key], _TIME_OP_STAGE):
-                return False
-        return True
+            result = stage(art.s[key], limits["op_stage"])
+            if result not in ("optimal", "feasible"):
+                return
 
     run_all()
-    return _build_response(prep, art, solver, optimal=all_optimal)
+    return _build_response(prep, snap, optimal=all_optimal)
 
 
-def _build_response(
-    prep: Prepared, art: ModelArtifacts, solver: cp_model.CpSolver, optimal: bool
+def _status_name(status: int) -> str:
+    if status == cp_model.OPTIMAL:
+        return "optimal"
+    if status == cp_model.FEASIBLE:
+        return "feasible"
+    if status == cp_model.INFEASIBLE:
+        return "infeasible"
+    return "unknown"
+
+
+def _adjudicate_negative(
+    prep: Prepared, req: PlanRequest, first_status: int
 ) -> PlanResponse:
-    root_addr = {r: solver.Value(art.addr[r]) for r in prep.roots}
+    """Adjudicate a non-feasible first solve from three-valued evidence.
 
+    Two diagnostic probes relax one resource at a time, each bound guaranteed
+    sufficient for that resource:
+
+    * deadline probe — memory relaxed to ``S`` (sequential aligned placement
+      always fits), keeping the requested deadline;
+    * memory probe — deadline relaxed to ``H`` (each path's own total work
+      always suffices on the non-serialized timeline), keeping the requested
+      memory.
+
+    Each probe reports True (feasible witness), False (proved infeasible) or
+    None (undecided, e.g. time-out). A feasible relaxation whose witness also
+    satisfies the *other* original bound is a feasible plan for the original
+    request, so an UNKNOWN first solve is upgraded to a concrete plan — never
+    to "optimal".
+    """
+    limits = _time_limits()
+    d_probe = _run_probe(
+        prep, req.deadline, max(req.memory_limit, prep.S), limits["probe"]
+    )
+    m_probe = _run_probe(
+        prep, max(req.deadline, prep.H), req.memory_limit, limits["probe"]
+    )
+
+    # Rescue: a relaxation witness that also obeys both original bounds.
+    for probe in (d_probe, m_probe):
+        if probe.feasible is True and probe.snapshot is not None:
+            snap = probe.snapshot
+            if snap.cap <= req.memory_limit and max(snap.ep.values()) <= req.deadline:
+                return _build_response(prep, snap, optimal=False)
+
+    d_ok, m_ok = d_probe.feasible, m_probe.feasible
+
+    # A precise resource reason requires BOTH probes to be definite:
+    #
+    #   deadline probe   memory probe   meaning
+    #   False            False          deadline alone impossible AND memory
+    #                                   alone impossible
+    #   True             False          a timely layout exists with enough
+    #                                   memory, but none fits this memory
+    #                                   -> memory_limit
+    #   False            True          a fitting layout exists with enough
+    #                                   time, but none meets this deadline
+    #                                   -> deadline
+    #   True             True           each bound is separately attainable
+    #                                   but only at the other's expense
+    #                                   -> deadline_and_memory_limit
+    if d_ok is not None and m_ok is not None:
+        if not d_ok and not m_ok:
+            return _infeasible_response("deadline_and_memory_limit")
+        if d_ok and not m_ok:
+            return _infeasible_response("memory_limit")
+        if not d_ok and m_ok:
+            return _infeasible_response("deadline")
+        return _infeasible_response("deadline_and_memory_limit")
+
+    # At least one probe is undecided. The request is still *proved*
+    # infeasible when the first solve proved it outright or a probe proved its
+    # relaxed problem impossible (an obstruction that survives extra slack
+    # also rules out the original request). In that case report infeasible but
+    # leave reason null: an undecided probe means the exact responsible
+    # resource is not established and must not be guessed. If nothing proved
+    # infeasibility, the whole request is undecided.
+    proved_infeasible = (
+        first_status == cp_model.INFEASIBLE or d_ok is False or m_ok is False
+    )
+    if proved_infeasible:
+        return _infeasible_response(None)
+    return _unknown_response()
+
+
+def _run_probe(
+    prep: Prepared, deadline: int, memory_limit: int, time_limit: float
+) -> ProbeResult:
+    art = build_model(prep, deadline, memory_limit)
+    solver = _new_solver(time_limit)
+    status = solver.Solve(art.model)
+    if status in _PROVED_FEASIBLE:
+        return ProbeResult(feasible=True, snapshot=_snapshot(prep, art, solver))
+    if status == cp_model.INFEASIBLE:
+        return ProbeResult(feasible=False)
+    return ProbeResult(feasible=None)
+
+
+def _build_response(prep: Prepared, snap: Snapshot, optimal: bool) -> PlanResponse:
     timeline: list[PathSchedule] = []
     for pid in prep.path_ids:
         ops = [
             OpSchedule(
                 operator_id=oid,
-                start=solver.Value(art.s[(pid, oid)]),
-                end=solver.Value(art.f[(pid, oid)]),
+                start=snap.s[(pid, oid)],
+                end=snap.f[(pid, oid)],
             )
             for oid in prep.path_op_order[pid]
         ]
-        peak = _path_peak(prep, art, solver, pid)
+        peak = _path_peak(prep, snap, pid)
         timeline.append(
             PathSchedule(
                 path_id=pid,
-                start=solver.Value(art.sp[pid]),
-                end=solver.Value(art.ep[pid]),
+                start=snap.sp[pid],
+                end=snap.ep[pid],
                 peak_bytes=peak,
                 operators=ops,
             )
@@ -537,29 +714,29 @@ def _build_response(
     addresses = [
         TensorAddress(
             tensor_id=tid,
-            address=root_addr[info.root] + info.cum_offset,
+            address=snap.addr[info.root] + info.cum_offset,
             bytes=info.size,
         )
         for tid, info in sorted(prep.tensors.items())
     ]
     return PlanResponse(
+        status="feasible",
         feasible=True,
         optimal=optimal,
-        capacity_upper_bound=solver.Value(art.cap),
+        reason=None,
+        capacity_upper_bound=snap.cap,
         timeline=timeline,
         addresses=addresses,
     )
 
 
-def _path_peak(
-    prep: Prepared, art: ModelArtifacts, solver: cp_model.CpSolver, pid: str
-) -> int:
+def _path_peak(prep: Prepared, snap: Snapshot, pid: str) -> int:
     events: list[tuple[int, int, int]] = []  # (time, kind, delta); end before start
     for r in prep.roots:
-        if (pid, r) not in art.presence or solver.Value(art.presence[(pid, r)]) == 0:
+        if (pid, r) not in snap.presence or snap.presence[(pid, r)] == 0:
             continue
-        ls = solver.Value(art.lstart[(pid, r)])
-        le = solver.Value(art.lend[(pid, r)])
+        ls = snap.lstart[(pid, r)]
+        le = snap.lend[(pid, r)]
         if le <= ls:
             continue
         events.append((ls, 1, prep.root_size[r]))   # acquire
@@ -572,19 +749,9 @@ def _path_peak(
     return peak
 
 
-def _infeasible_response(prep: Prepared, req: PlanRequest) -> PlanResponse:
-    # Relax one resource at a time using its guaranteed-sufficient bound:
-    # S = sum of all live root sizes always fits memory; H = the largest
-    # per-path total work always fits the (non-serialized) timeline.
-    deadline_ok = _feasible(prep, req.deadline, prep.S)
-    memory_ok = _feasible(prep, prep.H, req.memory_limit)
-    if not deadline_ok and not memory_ok:
-        reason = "deadline_and_memory_limit"
-    elif not deadline_ok:
-        reason = "deadline"
-    else:
-        reason = "memory_limit"
+def _infeasible_response(reason: Optional[str]) -> PlanResponse:
     return PlanResponse(
+        status="infeasible",
         feasible=False,
         optimal=False,
         reason=reason,
@@ -594,8 +761,16 @@ def _infeasible_response(prep: Prepared, req: PlanRequest) -> PlanResponse:
     )
 
 
-def _feasible(prep: Prepared, deadline: int, memory_limit: int) -> bool:
-    art = build_model(prep, deadline, memory_limit)
-    solver = _new_solver(_TIME_PROBE)
-    status = solver.Solve(art.model)
-    return status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+def _unknown_response() -> PlanResponse:
+    # CP-SAT could neither find a plan nor prove impossibility in the budget.
+    # No reason is fabricated and feasibility stays null: this is explicitly
+    # undecided, never a dressed-up "no solution".
+    return PlanResponse(
+        status="unknown",
+        feasible=None,
+        optimal=False,
+        reason=None,
+        capacity_upper_bound=0,
+        timeline=[],
+        addresses=[],
+    )

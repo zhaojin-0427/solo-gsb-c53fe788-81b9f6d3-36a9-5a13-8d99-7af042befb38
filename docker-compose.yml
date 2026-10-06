@@ -5,6 +5,14 @@ services:
     container_name: inference-buffer-planner
     ports:
       - "8000:8000"
+    environment:
+      # Per-stage CP-SAT time budgets in seconds. The defaults match the
+      # built-in limits; override on the host to reproduce time-out
+      # (undecided / HTTP 503) behaviour, e.g. PLANNER_STAGE1_SECONDS=0.
+      PLANNER_STAGE1_SECONDS: ${PLANNER_STAGE1_SECONDS:-10.0}
+      PLANNER_STAGE_SECONDS: ${PLANNER_STAGE_SECONDS:-0.3}
+      PLANNER_OP_STAGE_SECONDS: ${PLANNER_OP_STAGE_SECONDS:-0.08}
+      PLANNER_PROBE_SECONDS: ${PLANNER_PROBE_SECONDS:-5.0}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
